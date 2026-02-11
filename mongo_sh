@@ -1,0 +1,1838 @@
+#!/bin/bash
+# MongoDB Interactive Tool
+# Usage: ./mongo_sh
+#
+# 部署方式:
+#   1. 下载 mongosh linux x64 压缩包:
+#      https://downloads.mongodb.com/compass/mongosh-2.3.8-linux-x64.tgz
+#   2. 解压后将 bin/mongosh 放到本脚本同目录下
+#   3. 编辑同目录下 config.json 配置连接信息
+#   4. chmod +x mongo_sh mongosh
+#   5. ./mongo_sh
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.json"
+HISTORY_FILE="$SCRIPT_DIR/.mongo_history"
+MONGOSH=""
+COLLECTION=""
+FILTER="{}"
+DB=""
+MONGO_URI=""
+DEFAULT_LIMIT=20
+EXPORT_LIMIT=10000
+ENV_NAME=""
+
+# field schema cache
+FIELD_NAMES=()
+FIELD_TYPES=()
+SUGGESTIONS=()
+SUGGEST_FILTERS=()
+
+# ---------- load config ----------
+
+parse_json_field() { echo "$1" | grep -o "\"$2\" *: *\"[^\"]*\"" | head -1 | sed "s/\"$2\" *: *\"\([^\"]*\)\"/\1/"; }
+parse_json_num()   { echo "$1" | grep -o "\"$2\" *: *[0-9]*" | head -1 | sed "s/\"$2\" *: *\([0-9]*\)/\1/"; }
+parse_json_bool()  { echo "$1" | grep -o "\"$2\" *: *[a-z]*" | head -1 | sed "s/\"$2\" *: *\([a-z]*\)/\1/"; }
+
+build_mongo_uri() {
+  local host="$1" port="$2" database="$3" username="$4" password="$5" auth_source="$6" ssl_flag="$7"
+  host=${host:-127.0.0.1}
+  port=${port:-27017}
+  database=${database:-test}
+  auth_source=${auth_source:-$database}
+
+  local ssl_param="false"
+  [[ "$ssl_flag" == "true" ]] && ssl_param="true"
+
+  if [[ -n "$username" && -n "$password" ]]; then
+    MONGO_URI="mongodb://${username}:${password}@${host}:${port}/${database}?authSource=${auth_source}&ssl=${ssl_param}"
+  else
+    MONGO_URI="mongodb://${host}:${port}/${database}?ssl=${ssl_param}"
+  fi
+  DB="$database"
+}
+
+config_is_valid() {
+  local cfg="$1"
+  [[ -z "$cfg" ]] && return 1
+  # multi-env: must have environments keyword
+  if echo "$cfg" | grep -q '"environments"'; then
+    echo "$cfg" | grep -q '"host"' && return 0
+    return 1
+  fi
+  # single-env: must have host
+  echo "$cfg" | grep -q '"host"' && return 0
+  return 1
+}
+
+collect_env_params() {
+  local prefix="$1"  # display prefix like "  " or "  [环境名] "
+  local _host _port _db _user _pass _auth _ssl
+
+  read -rp "${prefix}主机地址 [127.0.0.1]: " _host
+  _host=${_host:-127.0.0.1}
+  read -rp "${prefix}端口 [27017]: " _port
+  _port=${_port:-27017}
+  while [[ ! "$_port" =~ ^[0-9]+$ ]] || (( _port < 1 || _port > 65535 )); do
+    echo "${prefix}无效端口号，请输入 1-65535"
+    read -rp "${prefix}端口 [27017]: " _port
+    _port=${_port:-27017}
+  done
+  read -rp "${prefix}数据库名: " _db
+  while [[ -z "$_db" ]]; do
+    echo "${prefix}数据库名不能为空"
+    read -rp "${prefix}数据库名: " _db
+  done
+  read -rp "${prefix}用户名 (无认证直接回车): " _user
+  if [[ -n "$_user" ]]; then
+    read -rsp "${prefix}密码: " _pass; echo ""
+    read -rp "${prefix}认证数据库 [$_db]: " _auth
+    _auth=${_auth:-$_db}
+  fi
+  echo "${prefix}启用 SSL?"
+  echo "${prefix}  [1] 否(默认)  [2] 是"
+  local ssl_choice
+  read -rp "${prefix}选择: " ssl_choice
+  _ssl="false"
+  [[ "$ssl_choice" == "2" ]] && _ssl="true"
+
+  # return via ENV_RESULT (avoid subshell losing state)
+  ENV_RESULT_HOST="$_host"
+  ENV_RESULT_PORT="$_port"
+  ENV_RESULT_DB="$_db"
+  ENV_RESULT_USER="$_user"
+  ENV_RESULT_PASS="$_pass"
+  ENV_RESULT_AUTH="$_auth"
+  ENV_RESULT_SSL="$_ssl"
+}
+
+setup_wizard() {
+  echo ""
+  echo "=============================="
+  echo "  首次使用 — 配置向导"
+  echo "=============================="
+  echo ""
+  echo "未检测到有效配置，现在引导你完成 MongoDB 连接配置。"
+  echo ""
+  echo "配置模式:"
+  echo "  [1] 单环境 — 只配置一个 MongoDB 连接"
+  echo "  [2] 多环境 — 配置多个环境(如 开发/测试/生产)"
+  local mode
+  read -rp "选择 [默认1]: " mode
+  mode=${mode:-1}
+
+  local limit
+  read -rp "默认查询条数 [20]: " limit
+  limit=${limit:-20}
+
+  if [[ "$mode" == "2" ]]; then
+    # multi-env
+    local -a env_jsons
+    local env_idx=0
+    while true; do
+      echo ""
+      local env_name
+      read -rp "环境名称 (如 '开发环境'，输入 done 结束添加): " env_name
+      [[ "$env_name" == "done" ]] && break
+      [[ -z "$env_name" ]] && continue
+
+      echo "  配置 [$env_name]:"
+      collect_env_params "    "
+
+      local block="    {"
+      block="$block\n      \"name\": \"$env_name\","
+      block="$block\n      \"host\": \"$ENV_RESULT_HOST\","
+      block="$block\n      \"port\": $ENV_RESULT_PORT,"
+      block="$block\n      \"database\": \"$ENV_RESULT_DB\","
+      if [[ -n "$ENV_RESULT_USER" ]]; then
+        block="$block\n      \"username\": \"$ENV_RESULT_USER\","
+        block="$block\n      \"password\": \"$ENV_RESULT_PASS\","
+        block="$block\n      \"authSource\": \"$ENV_RESULT_AUTH\","
+      fi
+      block="$block\n      \"ssl\": $ENV_RESULT_SSL"
+      block="$block\n    }"
+      env_jsons+=("$block")
+      ((env_idx++))
+      echo "  ✓ 已添加 [$env_name] (已配置 $env_idx 个环境)"
+    done
+
+    if (( ${#env_jsons[@]} == 0 )); then
+      echo "未添加任何环境，退出"
+      exit 1
+    fi
+
+    # assemble JSON
+    local json="{\n  \"defaultLimit\": $limit,\n  \"environments\": [\n"
+    local first=true
+    for ej in "${env_jsons[@]}"; do
+      $first || json="$json,\n"
+      json="$json$ej"
+      first=false
+    done
+    json="$json\n  ]\n}"
+
+    echo -e "$json" > "$CONFIG_FILE"
+  else
+    # single-env
+    echo ""
+    collect_env_params "  "
+
+    local json="{"
+    json="$json\n  \"host\": \"$ENV_RESULT_HOST\","
+    json="$json\n  \"port\": $ENV_RESULT_PORT,"
+    json="$json\n  \"database\": \"$ENV_RESULT_DB\","
+    if [[ -n "$ENV_RESULT_USER" ]]; then
+      json="$json\n  \"username\": \"$ENV_RESULT_USER\","
+      json="$json\n  \"password\": \"$ENV_RESULT_PASS\","
+      json="$json\n  \"authSource\": \"$ENV_RESULT_AUTH\","
+    fi
+    json="$json\n  \"ssl\": $ENV_RESULT_SSL,"
+    json="$json\n  \"defaultLimit\": $limit"
+    json="$json\n}"
+
+    echo -e "$json" > "$CONFIG_FILE"
+  fi
+
+  echo ""
+  echo "✓ 配置已保存到 $CONFIG_FILE"
+  echo ""
+}
+
+load_config() {
+  local need_setup=false
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    need_setup=true
+  else
+    local cfg
+    cfg=$(cat "$CONFIG_FILE")
+    if ! config_is_valid "$cfg"; then
+      need_setup=true
+    fi
+  fi
+
+  if $need_setup; then
+    setup_wizard
+  fi
+
+  local cfg
+  cfg=$(cat "$CONFIG_FILE")
+
+  if ! config_is_valid "$cfg"; then
+    echo "错误: 配置文件内容无效，请检查 $CONFIG_FILE" >&2
+    exit 1
+  fi
+
+  # detect multi-environment format
+  if echo "$cfg" | grep -q '"environments"'; then
+    load_config_multi_env "$cfg"
+  else
+    load_config_single "$cfg"
+  fi
+}
+
+load_config_single() {
+  local cfg="$1"
+  build_mongo_uri \
+    "$(parse_json_field "$cfg" "host")" \
+    "$(parse_json_num "$cfg" "port")" \
+    "$(parse_json_field "$cfg" "database")" \
+    "$(parse_json_field "$cfg" "username")" \
+    "$(parse_json_field "$cfg" "password")" \
+    "$(parse_json_field "$cfg" "authSource")" \
+    "$(parse_json_bool "$cfg" "ssl")"
+  DEFAULT_LIMIT=$(parse_json_num "$cfg" "defaultLimit")
+  DEFAULT_LIMIT=${DEFAULT_LIMIT:-20}
+  EXPORT_LIMIT=$(parse_json_num "$cfg" "exportLimit")
+  EXPORT_LIMIT=${EXPORT_LIMIT:-10000}
+  ENV_NAME="default"
+  echo "配置: $(parse_json_field "$cfg" "host"):$(parse_json_num "$cfg" "port")/$DB"
+}
+
+load_config_multi_env() {
+  local cfg="$1"
+  DEFAULT_LIMIT=$(parse_json_num "$cfg" "defaultLimit")
+  DEFAULT_LIMIT=${DEFAULT_LIMIT:-20}
+  EXPORT_LIMIT=$(parse_json_num "$cfg" "exportLimit")
+  EXPORT_LIMIT=${EXPORT_LIMIT:-10000}
+
+  # extract environment blocks
+  local -a env_names env_blocks
+  local idx=0
+  while IFS= read -r block; do
+    [[ -z "$block" ]] && continue
+    local name
+    name=$(parse_json_field "$block" "name")
+    env_names+=("${name:-env_$idx}")
+    env_blocks+=("$block")
+    ((idx++))
+  done < <(echo "$cfg" | sed -n '/"environments"/,/]/p' | grep -o '{[^{}]*}')
+
+  if (( ${#env_names[@]} == 0 )); then
+    echo "错误: environments 数组为空" >&2
+    exit 1
+  fi
+
+  select_environment env_names env_blocks
+}
+
+select_environment() {
+  local -n _names=$1 _blocks=$2
+
+  echo ""
+  echo "可用环境:"
+  print_sep
+  local i=1
+  for n in "${_names[@]}"; do
+    printf "  [%d] %s\n" "$i" "$n"
+    ((i++))
+  done
+  print_sep
+
+  local choice
+  while true; do
+    read -rp "请选择环境 [1-${#_names[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#_names[@]} )); then
+      break
+    fi
+    echo "无效输入"
+  done
+
+  local blk="${_blocks[$((choice - 1))]}"
+  ENV_NAME="${_names[$((choice - 1))]}"
+
+  build_mongo_uri \
+    "$(parse_json_field "$blk" "host")" \
+    "$(parse_json_num "$blk" "port")" \
+    "$(parse_json_field "$blk" "database")" \
+    "$(parse_json_field "$blk" "username")" \
+    "$(parse_json_field "$blk" "password")" \
+    "$(parse_json_field "$blk" "authSource")" \
+    "$(parse_json_bool "$blk" "ssl")"
+
+  local host port
+  host=$(parse_json_field "$blk" "host")
+  port=$(parse_json_num "$blk" "port")
+  echo "已选择: $ENV_NAME (${host}:${port}/$DB)"
+}
+
+# ---------- helpers ----------
+
+detect_mongosh() {
+  if [[ -x "$SCRIPT_DIR/mongosh" ]]; then
+    MONGOSH="$SCRIPT_DIR/mongosh"
+  elif command -v mongosh &>/dev/null; then
+    MONGOSH="mongosh"
+  else
+    echo "错误: 未找到 mongosh" >&2
+    echo "  1. 下载: https://downloads.mongodb.com/compass/mongosh-2.3.8-linux-x64.tgz" >&2
+    echo "  2. 解压后将 bin/mongosh 拷贝到本脚本同目录" >&2
+    echo "  3. chmod +x mongosh" >&2
+    exit 1
+  fi
+  echo "使用: $MONGOSH"
+}
+
+run_js() {
+  "$MONGOSH" "$MONGO_URI" --quiet --eval "$1" 2> >(grep -v "^DeprecationWarning" >&2)
+}
+
+print_sep() {
+  printf '%*s\n' 60 '' | tr ' ' '-'
+}
+
+run_with_spinner() {
+  local msg="$1"; shift
+  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local i=0
+
+  "$@" &
+  local pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  %s %s " "${spin:i++%${#spin}:1}" "$msg"
+    sleep 0.1
+  done
+
+  wait "$pid"
+  local rc=$?
+  printf "\r  ✓ %s\n" "$msg"
+  return $rc
+}
+
+RUN_JS_RESULT=""
+run_js_spinner() {
+  local msg="$1" js="$2"
+  local jsfile tmpfile
+  jsfile=$(mktemp /tmp/mq_XXXXXX.js)
+  tmpfile=$(mktemp /tmp/mq_XXXXXX.out)
+  chmod 600 "$jsfile" "$tmpfile"
+  echo "$js" > "$jsfile"
+
+  run_with_spinner "$msg" "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" > "$tmpfile" 2>&1
+
+  RUN_JS_RESULT=$(cat "$tmpfile")
+  rm -f "$jsfile" "$tmpfile"
+}
+
+run_export_streaming() {
+  local msg="$1" js="$2" outfile="$3"
+  local jsfile
+  jsfile=$(mktemp /tmp/mq_XXXXXX.js)
+  chmod 600 "$jsfile"
+  echo "$js" > "$jsfile"
+
+  run_with_spinner "$msg" "$MONGOSH" "$MONGO_URI" --quiet --file "$jsfile" >> "$outfile" 2>/dev/null
+
+  rm -f "$jsfile"
+}
+
+escape_js_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//\'/\\\'}"
+  s="${s//\`/\\\`}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  echo "$s"
+}
+
+format_value() {
+  local v="$1"
+  if [[ "$v" =~ ^-?[0-9]+$ ]]; then echo "$v"
+  elif [[ "$v" =~ ^-?[0-9]+\.[0-9]+$ ]]; then echo "$v"
+  elif [[ "$v" == "true" || "$v" == "false" ]]; then echo "$v"
+  elif [[ "$v" == "null" ]]; then echo "null"
+  else echo "\"$(escape_js_str "$v")\""
+  fi
+}
+
+# ---------- query history ----------
+
+save_history() {
+  local filter="$1" limit="$2"
+  local ts
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  printf '%s\t%s\t%s\t%s\n' "$ts" "$COLLECTION" "$filter" "$limit" >> "$HISTORY_FILE"
+  # keep last 20
+  if [[ -f "$HISTORY_FILE" ]]; then
+    local count
+    count=$(wc -l < "$HISTORY_FILE")
+    if (( count > 20 )); then
+      tail -20 "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
+      mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+    fi
+  fi
+}
+
+show_history() {
+  echo ""
+  echo "── 查询历史 ──────────────────"
+  if [[ ! -f "$HISTORY_FILE" ]] || [[ ! -s "$HISTORY_FILE" ]]; then
+    echo "  (暂无历史记录)"
+    return
+  fi
+
+  local -a lines
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && lines+=("$line")
+  done < "$HISTORY_FILE"
+
+  printf "  %-4s %-20s %-20s %-6s %s\n" "编号" "时间" "集合" "条数" "过滤条件"
+  print_sep
+  local i=1
+  for line in "${lines[@]}"; do
+    IFS=$'\t' read -r ts col flt lim <<< "$line"
+    printf "  [%-2d] %-20s %-20s %-6s %s\n" "$i" "$ts" "$col" "$lim" "$flt"
+    ((i++))
+  done
+  print_sep
+
+  local choice
+  read -rp "输入编号重新执行 (回车返回): " choice
+  [[ -z "$choice" ]] && return
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#lines[@]} )); then
+    IFS=$'\t' read -r _ col flt lim <<< "${lines[$((choice - 1))]}"
+    if [[ "$col" != "$COLLECTION" ]]; then
+      echo "  切换集合至: $col"
+      COLLECTION="$col"
+      analyze_fields
+    fi
+    FILTER="$flt"
+    echo ""
+    echo "执行: db.$COLLECTION.find($FILTER).sort({_id:-1}).limit($lim)"
+    print_sep
+    local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1}).limit($lim).forEach(doc => print(JSON.stringify(doc, null, 2)))"
+    run_js "$js"
+    print_sep
+    local total
+    total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+    echo "匹配总数: $total | 本次显示: $lim 条"
+  else
+    echo "无效编号"
+  fi
+}
+
+# ---------- list & select collection ----------
+
+select_collection() {
+  echo "正在获取集合列表..."
+  local raw
+  raw=$(run_js "db.getCollectionNames().forEach(c => print(c))")
+  if [[ -z "$raw" ]]; then
+    echo "错误: 无法获取集合列表，请检查连接信息和网络" >&2
+    return 1
+  fi
+
+  local -a cols
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && cols+=("$line")
+  done <<< "$raw"
+
+  echo ""
+  echo "可用集合 (共 ${#cols[@]} 个):"
+  print_sep
+  local i=1
+  for c in "${cols[@]}"; do
+    printf "  [%d] %s\n" "$i" "$c"
+    ((i++))
+  done
+  print_sep
+
+  local choice
+  while true; do
+    read -rp "请选择集合编号 [1-${#cols[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#cols[@]} )); then
+      COLLECTION="${cols[$((choice - 1))]}"
+      echo "已选择: $COLLECTION"
+      analyze_fields
+      return
+    fi
+    echo "无效输入，请重新选择"
+  done
+}
+
+# ---------- field analysis ----------
+
+analyze_fields() {
+  echo "正在分析字段结构..."
+  FIELD_NAMES=()
+  FIELD_TYPES=()
+  SUGGESTIONS=()
+  SUGGEST_FILTERS=()
+
+  local js
+  js=$(cat <<'JSEOF'
+const sample = db.getSiblingDB('__DB__').getCollection('__COL__')
+  .find({}).sort({_id:-1}).limit(10).toArray();
+const schema = {};
+function walk(obj, prefix) {
+  for (const k of Object.keys(obj)) {
+    const full = prefix ? prefix + '.' + k : k;
+    const v = obj[k];
+    let t = typeof v;
+    if (v === null) t = 'null';
+    else if (Array.isArray(v)) t = 'array';
+    else if (v instanceof Date) t = 'date';
+    else if (v instanceof ObjectId) t = 'objectId';
+    if (!schema[full]) schema[full] = new Set();
+    schema[full].add(t);
+    if (t === 'object' && v !== null && !Array.isArray(v)
+        && !(v instanceof Date) && !(v instanceof ObjectId)) {
+      walk(v, full);
+    }
+  }
+}
+sample.forEach(doc => walk(doc, ''));
+const lines = [];
+for (const [field, types] of Object.entries(schema).sort()) {
+  lines.push(field + '|' + [...types].join(','));
+}
+print(lines.join('\n'));
+JSEOF
+)
+  js="${js//__DB__/$DB}"
+  js="${js//__COL__/$COLLECTION}"
+
+  local raw
+  raw=$(run_js "$js")
+  if [[ -z "$raw" ]]; then
+    echo "  (无法分析字段，集合可能为空)"
+    return
+  fi
+
+  local idx=1
+  echo ""
+  printf "  %-4s %-30s %-15s %s\n" "编号" "字段" "类型" "建议过滤"
+  print_sep
+
+  while IFS='|' read -r fname ftype; do
+    [[ -z "$fname" ]] && continue
+    FIELD_NAMES+=("$fname")
+    FIELD_TYPES+=("$ftype")
+
+    local suggestion="" sfilter=""
+    case "$ftype" in
+      *string*)   suggestion="精确 / 模糊";            sfilter="string" ;;
+      *number*)   suggestion="精确 / 范围(>  <  >=  <=)"; sfilter="number" ;;
+      *boolean*)  suggestion="true / false";            sfilter="boolean" ;;
+      *date*)     suggestion="范围(>  <  >=  <=)";      sfilter="date" ;;
+      *objectId*) suggestion="精确匹配";                sfilter="objectId" ;;
+      *array*)    suggestion="包含元素";                sfilter="array" ;;
+      *)          suggestion="-";                       sfilter="other" ;;
+    esac
+    SUGGESTIONS+=("$suggestion")
+    SUGGEST_FILTERS+=("$sfilter")
+
+    printf "  [%-2d] %-30s %-15s %s\n" "$idx" "$fname" "$ftype" "$suggestion"
+    ((idx++))
+  done <<< "$raw"
+  print_sep
+}
+
+# ---------- interactive filter by field number ----------
+
+prompt_filter_for_field() {
+  local fidx="$1"
+  local fname="${FIELD_NAMES[$fidx]}"
+  local ftype="${SUGGEST_FILTERS[$fidx]}"
+
+  case "$ftype" in
+    string)
+      echo "  字段 [$fname] (string) 过滤方式:"
+      echo "    [1] 精确匹配    [2] 模糊匹配(正则)"
+      local mode; read -rp "  选择 [1/2]: " mode
+      local val;  read -rp "  输入值: " val
+      val=$(escape_js_str "$val")
+      if [[ "$mode" == "2" ]]; then
+        echo "\"$fname\":{\"\$regex\":\"$val\",\"\$options\":\"i\"}"
+      else
+        echo "\"$fname\":\"$val\""
+      fi
+      ;;
+    number)
+      echo "  字段 [$fname] (number) 过滤方式:"
+      echo "    [1] =等于  [2] >大于  [3] >=大于等于  [4] <小于  [5] <=小于等于  [6] 范围(min~max)"
+      local mode; read -rp "  选择 [1-6]: " mode
+      case "$mode" in
+        1) local val; read -rp "  输入值: " val;     echo "\"$fname\":$(format_value "$val")" ;;
+        2) local val; read -rp "  大于: " val;       echo "\"$fname\":{\"\$gt\":$(format_value "$val")}" ;;
+        3) local val; read -rp "  大于等于: " val;   echo "\"$fname\":{\"\$gte\":$(format_value "$val")}" ;;
+        4) local val; read -rp "  小于: " val;       echo "\"$fname\":{\"\$lt\":$(format_value "$val")}" ;;
+        5) local val; read -rp "  小于等于: " val;   echo "\"$fname\":{\"\$lte\":$(format_value "$val")}" ;;
+        6)
+          local vmin; read -rp "  最小值(>=): " vmin
+          local vmax; read -rp "  最大值(<=): " vmax
+          echo "\"$fname\":{\"\$gte\":$(format_value "$vmin"),\"\$lte\":$(format_value "$vmax")}"
+          ;;
+        *) echo "" ;;
+      esac
+      ;;
+    boolean)
+      echo "  字段 [$fname] (boolean):"
+      echo "    [1] true    [2] false"
+      local mode; read -rp "  选择 [1/2]: " mode
+      [[ "$mode" == "1" ]] && echo "\"$fname\":true" || echo "\"$fname\":false"
+      ;;
+    date)
+      echo "  字段 [$fname] (date) 过滤方式:"
+      echo "    [1] 之后(>)  [2] 之前(<)  [3] 范围"
+      echo "    日期格式: 2024-01-01 或 2024-01-01T00:00:00Z"
+      local mode; read -rp "  选择 [1-3]: " mode
+      case "$mode" in
+        1) local val;  read -rp "  晚于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$gt\":{\"\$date\":\"${val}\"}}" ;;
+        2) local val;  read -rp "  早于: " val;  val=$(escape_js_str "$val");  echo "\"$fname\":{\"\$lt\":{\"\$date\":\"${val}\"}}" ;;
+        3)
+          local vmin; read -rp "  开始日期(>=): " vmin; vmin=$(escape_js_str "$vmin")
+          local vmax; read -rp "  结束日期(<=): " vmax; vmax=$(escape_js_str "$vmax")
+          echo "\"$fname\":{\"\$gte\":{\"\$date\":\"${vmin}\"},\"\$lte\":{\"\$date\":\"${vmax}\"}}"
+          ;;
+        *) echo "" ;;
+      esac
+      ;;
+    objectId)
+      local val; read -rp "  输入 ObjectId: " val
+      val=$(escape_js_str "$val")
+      echo "\"$fname\":ObjectId(\"$val\")"
+      ;;
+    *)
+      local val; read -rp "  输入 $fname 的值: " val
+      echo "\"$fname\":$(format_value "$val")"
+      ;;
+  esac
+}
+
+# ---------- build filter ----------
+
+parse_filter_expr() {
+  local input="$1"
+  if [[ "$input" =~ ^([^=\>\<\~]+)\>=(.+)$ ]]; then
+    echo "\"${BASH_REMATCH[1]}\":{\"\$gte\":$(format_value "${BASH_REMATCH[2]}")}"
+  elif [[ "$input" =~ ^([^=\>\<\~]+)\>(.+)$ ]]; then
+    echo "\"${BASH_REMATCH[1]}\":{\"\$gt\":$(format_value "${BASH_REMATCH[2]}")}"
+  elif [[ "$input" =~ ^([^=\>\<\~]+)\<=(.+)$ ]]; then
+    echo "\"${BASH_REMATCH[1]}\":{\"\$lte\":$(format_value "${BASH_REMATCH[2]}")}"
+  elif [[ "$input" =~ ^([^=\>\<\~]+)\<(.+)$ ]]; then
+    echo "\"${BASH_REMATCH[1]}\":{\"\$lt\":$(format_value "${BASH_REMATCH[2]}")}"
+  elif [[ "$input" =~ ^([^=\>\<\~]+)\~(.+)$ ]]; then
+    local val
+    val=$(escape_js_str "${BASH_REMATCH[2]}")
+    echo "\"${BASH_REMATCH[1]}\":{\"\$regex\":\"$val\",\"\$options\":\"i\"}"
+  elif [[ "$input" =~ ^([^=\>\<\~]+)=(.+)$ ]]; then
+    echo "\"${BASH_REMATCH[1]}\":$(format_value "${BASH_REMATCH[2]}")"
+  fi
+}
+
+build_filter() {
+  local -a parts
+  echo ""
+
+  if (( ${#FIELD_NAMES[@]} > 0 )); then
+    echo "添加过滤条件 — 输入字段编号选择，或手动输入(如 field=value)"
+    echo "  直接回车 = 跳过(无过滤)  |  done = 结束添加"
+    print_sep
+
+    while true; do
+      local input
+      read -rp "过滤(编号或表达式): " input
+      [[ -z "$input" || "$input" == "done" ]] && break
+
+      if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#FIELD_NAMES[@]} )); then
+        local part
+        part=$(prompt_filter_for_field $((input - 1)))
+        if [[ -n "$part" ]]; then
+          parts+=("$part")
+          echo "  已添加: $part"
+        fi
+        continue
+      fi
+
+      local parsed
+      parsed=$(parse_filter_expr "$input")
+      if [[ -n "$parsed" ]]; then
+        parts+=("$parsed")
+        echo "  已添加: $input"
+      else
+        echo "无法识别，请输入字段编号或 field=value 格式"
+      fi
+    done
+  else
+    echo "添加过滤条件 (直接回车跳过，输入 done 结束)"
+    echo "  格式: field=value  field>value  field~pattern"
+    print_sep
+    while true; do
+      local input
+      read -rp "过滤条件: " input
+      [[ -z "$input" || "$input" == "done" ]] && break
+      local parsed
+      parsed=$(parse_filter_expr "$input")
+      if [[ -n "$parsed" ]]; then
+        parts+=("$parsed")
+        echo "  已添加: $input"
+      else
+        echo "格式无法识别"
+      fi
+    done
+  fi
+
+  if (( ${#parts[@]} == 0 )); then
+    FILTER="{}"
+  else
+    local joined
+    joined=$(IFS=,; echo "${parts[*]}")
+    FILTER="{$joined}"
+  fi
+}
+
+# ---------- select fields for projection ----------
+
+select_projection() {
+  PROJECTION="{}"
+  if (( ${#FIELD_NAMES[@]} == 0 )); then return; fi
+
+  echo ""
+  echo "选择要显示的字段 (输入编号，多个用空格分隔，回车=全部):"
+  local i=1
+  for f in "${FIELD_NAMES[@]}"; do
+    printf "  [%d] %s" "$i" "$f"
+    (( i % 4 == 0 )) && echo "" || printf "\t"
+    ((i++))
+  done
+  echo ""
+
+  local input
+  read -rp "字段编号: " input
+  [[ -z "$input" ]] && return
+
+  local -a proj_parts
+  for num in $input; do
+    if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#FIELD_NAMES[@]} )); then
+      proj_parts+=("\"${FIELD_NAMES[$((num - 1))]}\":1")
+    fi
+  done
+
+  if (( ${#proj_parts[@]} > 0 )); then
+    local joined
+    joined=$(IFS=,; echo "${proj_parts[*]}")
+    PROJECTION="{$joined}"
+  fi
+}
+
+# ---------- select sort field ----------
+
+SORT_SPEC='{_id:-1}'
+
+select_sort() {
+  SORT_SPEC='{_id:-1}'
+  if (( ${#FIELD_NAMES[@]} == 0 )); then return; fi
+
+  echo ""
+  echo "选择排序字段 (回车=默认 _id 倒序):"
+  local i=1
+  for f in "${FIELD_NAMES[@]}"; do
+    printf "  [%d] %s" "$i" "$f"
+    (( i % 4 == 0 )) && echo "" || printf "\t"
+    ((i++))
+  done
+  echo ""
+
+  local input
+  read -rp "字段编号: " input
+  [[ -z "$input" ]] && return
+
+  if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#FIELD_NAMES[@]} )); then
+    local fname="${FIELD_NAMES[$((input - 1))]}"
+    echo "  [1] 升序(ASC)  [2] 降序(DESC)"
+    local dir
+    read -rp "  排序方向 [默认2]: " dir
+    dir=${dir:-2}
+    if [[ "$dir" == "1" ]]; then
+      SORT_SPEC="{\"$fname\":1}"
+    else
+      SORT_SPEC="{\"$fname\":-1}"
+    fi
+  fi
+}
+
+# ========== QUERY FUNCTIONS ==========
+
+do_query() {
+  local limit
+  read -rp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
+  limit=${limit:-$DEFAULT_LIMIT}
+  [[ ! "$limit" =~ ^[0-9]+$ ]] && limit=$DEFAULT_LIMIT
+
+  build_filter
+
+  echo ""
+  echo "执行: db.$COLLECTION.find($FILTER).sort({_id:-1}).limit($limit)"
+  print_sep
+
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)))"
+  run_js "$js"
+  print_sep
+
+  local total
+  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  echo "匹配总数: $total | 本次显示: $limit 条"
+
+  save_history "$FILTER" "$limit"
+}
+
+do_query_projection() {
+  local limit
+  read -rp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
+  limit=${limit:-$DEFAULT_LIMIT}
+  [[ ! "$limit" =~ ^[0-9]+$ ]] && limit=$DEFAULT_LIMIT
+
+  build_filter
+  select_projection
+
+  echo ""
+  echo "执行: db.$COLLECTION.find($FILTER, $PROJECTION).sort({_id:-1}).limit($limit)"
+  print_sep
+
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER, $PROJECTION).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)))"
+  run_js "$js"
+  print_sep
+
+  local total
+  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  echo "匹配总数: $total | 本次显示: $limit 条"
+
+  save_history "$FILTER" "$limit"
+}
+
+do_query_pagination() {
+  local page_size
+  read -rp "每页条数 [默认 $DEFAULT_LIMIT]: " page_size
+  page_size=${page_size:-$DEFAULT_LIMIT}
+  [[ ! "$page_size" =~ ^[0-9]+$ ]] && page_size=$DEFAULT_LIMIT
+
+  build_filter
+
+  local total
+  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  [[ ! "$total" =~ ^[0-9]+$ ]] && total=0
+  local total_pages=$(( (total + page_size - 1) / page_size ))
+  (( total_pages == 0 )) && total_pages=1
+  local page=1
+
+  while true; do
+    local skip=$(( (page - 1) * page_size ))
+    echo ""
+    echo "第 $page/$total_pages 页 (共 $total 条，每页 $page_size 条)"
+    print_sep
+
+    local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1}).skip($skip).limit($page_size).forEach(doc => print(JSON.stringify(doc, null, 2)))"
+    run_js "$js"
+    print_sep
+
+    echo "  [n] 下一页  [p] 上一页  [g] 跳转页  [q] 退出分页"
+    local nav
+    read -rp "操作: " nav
+    case "$nav" in
+      n|N) (( page < total_pages )) && ((page++)) || echo "已是最后一页" ;;
+      p|P) (( page > 1 )) && ((page--)) || echo "已是第一页" ;;
+      g|G)
+        local gp
+        read -rp "跳转到第几页 [1-$total_pages]: " gp
+        if [[ "$gp" =~ ^[0-9]+$ ]] && (( gp >= 1 && gp <= total_pages )); then
+          page=$gp
+        else
+          echo "无效页码"
+        fi
+        ;;
+      q|Q) break ;;
+      *) echo "无效输入" ;;
+    esac
+  done
+
+  save_history "$FILTER" "$page_size"
+}
+
+do_query_explain() {
+  build_filter
+
+  echo ""
+  echo "执行 Explain 分析: db.$COLLECTION.find($FILTER).explain('executionStats')"
+  print_sep
+
+  local js
+  js=$(cat <<JSEOF
+const stats = db.getSiblingDB('$DB').getCollection('$COLLECTION')
+  .find($FILTER).explain('executionStats');
+const es = stats.executionStats;
+print('查询计划: ' + stats.queryPlanner.winningPlan.stage);
+if (stats.queryPlanner.winningPlan.inputStage) {
+  print('输入阶段: ' + stats.queryPlanner.winningPlan.inputStage.stage);
+  if (stats.queryPlanner.winningPlan.inputStage.indexName) {
+    print('使用索引: ' + stats.queryPlanner.winningPlan.inputStage.indexName);
+  }
+}
+print('');
+print('执行时间: ' + es.executionTimeMillis + ' ms');
+print('扫描文档数: ' + es.totalDocsExamined);
+print('扫描索引数: ' + es.totalKeysExamined);
+print('返回文档数: ' + es.nReturned);
+const ratio = es.totalDocsExamined > 0
+  ? (es.nReturned / es.totalDocsExamined * 100).toFixed(1) + '%'
+  : 'N/A';
+print('命中率: ' + ratio);
+if (es.totalDocsExamined > 0 && es.totalKeysExamined === 0) {
+  print('');
+  print('⚠ 警告: 全表扫描(COLLSCAN)，建议为查询字段创建索引');
+}
+JSEOF
+)
+
+  run_js "$js"
+  print_sep
+}
+
+do_query_custom_sort() {
+  local limit
+  read -rp "查询条数 [默认 $DEFAULT_LIMIT]: " limit
+  limit=${limit:-$DEFAULT_LIMIT}
+  [[ ! "$limit" =~ ^[0-9]+$ ]] && limit=$DEFAULT_LIMIT
+
+  build_filter
+  select_sort
+
+  echo ""
+  echo "执行: db.$COLLECTION.find($FILTER).sort($SORT_SPEC).limit($limit)"
+  print_sep
+
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort($SORT_SPEC).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)))"
+  run_js "$js"
+  print_sep
+
+  local total
+  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  echo "匹配总数: $total | 本次显示: $limit 条"
+
+  save_history "$FILTER" "$limit"
+}
+
+# ========== DATA OPERATIONS ==========
+
+do_delete() {
+  build_filter
+
+  local count
+  count=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  echo ""
+  echo "匹配文档数: $count"
+
+  if [[ "$count" == "0" ]]; then
+    echo "没有匹配的文档"
+    return
+  fi
+
+  echo "  [1] 删除一条(deleteOne)  [2] 删除全部(deleteMany)"
+  local mode
+  read -rp "选择: " mode
+
+  local op
+  case "$mode" in
+    1) op="deleteOne" ;;
+    2) op="deleteMany" ;;
+    *) echo "已取消"; return ;;
+  esac
+
+  echo ""
+  if [[ "$FILTER" == "{}" && "$op" == "deleteMany" ]]; then
+    echo "  ⚠ 警告: 未设置过滤条件，将删除集合中全部 $count 条文档！"
+  fi
+  echo "即将执行: db.$COLLECTION.$op($FILTER)"
+  echo "  影响文档数: $([[ "$op" == "deleteOne" ]] && echo "1" || echo "$count")"
+  local confirm
+  read -rp "确认删除? [y/N]: " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
+
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER)"
+  run_js_spinner "正在删除..." "$js"
+  echo "结果: $RUN_JS_RESULT"
+}
+
+do_update() {
+  build_filter
+
+  local count
+  count=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  echo ""
+  echo "匹配文档数: $count"
+
+  if [[ "$count" == "0" ]]; then
+    echo "没有匹配的文档"
+    return
+  fi
+
+  if (( ${#FIELD_NAMES[@]} == 0 )); then
+    echo "字段信息为空，无法选择更新字段"
+    return
+  fi
+
+  echo ""
+  echo "选择要修改的字段:"
+  local i=1
+  for f in "${FIELD_NAMES[@]}"; do
+    printf "  [%d] %s\n" "$i" "$f"
+    ((i++))
+  done
+  print_sep
+
+  local fidx
+  read -rp "字段编号: " fidx
+  if ! [[ "$fidx" =~ ^[0-9]+$ ]] || (( fidx < 1 || fidx > ${#FIELD_NAMES[@]} )); then
+    echo "无效编号，已取消"
+    return
+  fi
+
+  local fname="${FIELD_NAMES[$((fidx - 1))]}"
+  local newval
+  read -rp "  $fname 的新值: " newval
+
+  local formatted_val
+  formatted_val=$(format_value "$newval")
+
+  echo ""
+  echo "  [1] 更新一条(updateOne)  [2] 更新全部(updateMany)"
+  local mode
+  read -rp "选择: " mode
+
+  local op
+  case "$mode" in
+    1) op="updateOne" ;;
+    2) op="updateMany" ;;
+    *) echo "已取消"; return ;;
+  esac
+
+  local update_doc="{\"\$set\":{\"$fname\":$formatted_val}}"
+  echo ""
+  if [[ "$FILTER" == "{}" && "$op" == "updateMany" ]]; then
+    echo "  ⚠ 警告: 未设置过滤条件，将更新集合中全部 $count 条文档！"
+  fi
+  echo "即将执行: db.$COLLECTION.$op($FILTER, $update_doc)"
+  local confirm
+  read -rp "确认更新? [y/N]: " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
+
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').$op($FILTER, $update_doc)"
+  run_js_spinner "正在更新..." "$js"
+  echo "结果: $RUN_JS_RESULT"
+}
+
+do_export() {
+  build_filter
+
+  local total
+  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  [[ ! "$total" =~ ^[0-9]+$ ]] && total=0
+  echo ""
+  echo "匹配文档数: $total"
+
+  local export_limit
+  read -rp "导出条数上限 [默认 $EXPORT_LIMIT，0=不限]: " export_limit
+  export_limit=${export_limit:-$EXPORT_LIMIT}
+  [[ ! "$export_limit" =~ ^[0-9]+$ ]] && export_limit=$EXPORT_LIMIT
+
+  local limit_clause=""
+  if (( export_limit > 0 )); then
+    limit_clause=".limit($export_limit)"
+    if (( total > export_limit )); then
+      echo "  提示: 匹配 $total 条，将只导出前 $export_limit 条 (可在 config.json 中修改 exportLimit)"
+    fi
+  fi
+
+  echo ""
+  echo "导出格式:  [1] JSON  [2] CSV"
+  local fmt
+  read -rp "选择 [默认1]: " fmt
+  fmt=${fmt:-1}
+
+  local ts
+  ts=$(date '+%Y%m%d_%H%M%S')
+  local ext="json"
+  [[ "$fmt" == "2" ]] && ext="csv"
+  local outfile="$SCRIPT_DIR/export_${COLLECTION}_${ts}.$ext"
+
+  if [[ "$fmt" == "2" ]]; then
+    # CSV export
+    if (( ${#FIELD_NAMES[@]} == 0 )); then
+      echo "字段信息为空，无法导出 CSV"
+      return
+    fi
+
+    # build header
+    local header
+    header=$(IFS=,; echo "${FIELD_NAMES[*]}")
+
+    # build JS to output CSV rows
+    local field_access=""
+    for f in "${FIELD_NAMES[@]}"; do
+      # handle nested fields with dot notation
+      local accessor="doc"
+      IFS='.' read -ra parts <<< "$f"
+      for p in "${parts[@]}"; do
+        accessor="${accessor}['${p}']"
+      done
+      [[ -n "$field_access" ]] && field_access="${field_access},"
+      field_access="${field_access}(${accessor} !== undefined && ${accessor} !== null ? String(${accessor}).replace(/,/g, ';').replace(/[\r\n]+/g, ' ') : '')"
+    done
+
+    local js
+    js=$(cat <<JSEOF
+const cursor = db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause};
+cursor.forEach(doc => {
+  const row = [$field_access];
+  print(row.join(','));
+});
+JSEOF
+)
+
+    echo "$header" > "$outfile"
+    run_export_streaming "正在导出 CSV..." "$js" "$outfile"
+  else
+    # JSON export
+    local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1})${limit_clause}.forEach(doc => print(JSON.stringify(doc)))"
+    : > "$outfile"
+    run_export_streaming "正在导出 JSON..." "$js" "$outfile"
+  fi
+
+  local line_count
+  line_count=$(wc -l < "$outfile")
+  echo "已导出: $outfile ($line_count 行)"
+}
+
+# ========== INDEX MANAGEMENT ==========
+
+show_indexes() {
+  echo ""
+  echo "集合 [$COLLECTION] 的索引列表:"
+  print_sep
+
+  local js
+  js=$(cat <<'JSEOF'
+const indexes = db.getSiblingDB('__DB__').getCollection('__COL__').getIndexes();
+indexes.forEach((idx, i) => {
+  const keys = Object.entries(idx.key).map(([k,v]) => {
+    const dir = v === 1 ? 'ASC' : v === -1 ? 'DESC' : v === 'text' ? 'TEXT' : v === 'hashed' ? 'HASH' : String(v);
+    return k + ' (' + dir + ')';
+  }).join(', ');
+  const props = [];
+  if (idx.unique) props.push('UNIQUE');
+  if (idx.sparse) props.push('SPARSE');
+  if (idx.expireAfterSeconds !== undefined) props.push('TTL=' + idx.expireAfterSeconds + 's');
+  if (idx.partialFilterExpression) props.push('PARTIAL');
+  const extra = props.length > 0 ? '  [' + props.join(', ') + ']' : '';
+  print((i+1) + '|' + idx.name + '|' + keys + extra);
+});
+JSEOF
+)
+  js="${js//__DB__/$DB}"
+  js="${js//__COL__/$COLLECTION}"
+
+  local raw
+  raw=$(run_js "$js")
+  if [[ -z "$raw" ]]; then
+    echo "  (无索引或查询失败)"
+    return
+  fi
+
+  printf "  %-4s %-30s %s\n" "编号" "索引名称" "字段 & 属性"
+  print_sep
+  while IFS='|' read -r num name keys; do
+    [[ -z "$num" ]] && continue
+    printf "  [%-2s] %-30s %s\n" "$num" "$name" "$keys"
+  done <<< "$raw"
+  print_sep
+}
+
+create_index() {
+  echo ""
+  if (( ${#FIELD_NAMES[@]} == 0 )); then
+    echo "字段信息为空，请先切换集合或查看字段"
+    return
+  fi
+
+  echo "创建索引 — 支持复合索引(多字段)"
+  echo ""
+  echo "可选字段:"
+  local i=1
+  for f in "${FIELD_NAMES[@]}"; do
+    printf "  [%d] %s\n" "$i" "$f"
+    ((i++))
+  done
+  print_sep
+  echo "操作: 输入字段编号逐个添加，输入 done 完成选择"
+  echo ""
+
+  local -a idx_fields
+  local added=0
+
+  while true; do
+    local input
+    read -rp "添加第$((added+1))个字段 (编号/done): " input
+    [[ "$input" == "done" ]] && break
+    [[ -z "$input" ]] && continue
+
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#FIELD_NAMES[@]} )); then
+      local fname="${FIELD_NAMES[$((input - 1))]}"
+      echo "    [1] 升序(ASC)  [2] 降序(DESC)  [3] TEXT  [4] HASHED"
+      local order
+      read -rp "  $fname 的排序方式 [默认1]: " order
+      order=${order:-1}
+      case "$order" in
+        1) idx_fields+=("\"$fname\":1") ;;
+        2) idx_fields+=("\"$fname\":-1") ;;
+        3) idx_fields+=("\"$fname\":\"text\"") ;;
+        4) idx_fields+=("\"$fname\":\"hashed\"") ;;
+        *) idx_fields+=("\"$fname\":1") ;;
+      esac
+      ((added++))
+      echo "  -> 已添加[$added]: $fname (继续添加下一个字段，或输入 done 完成)"
+    else
+      echo "  无效编号，请输入 1-${#FIELD_NAMES[@]}"
+    fi
+  done
+
+  if (( ${#idx_fields[@]} == 0 )); then
+    echo "未选择任何字段，取消创建"
+    return
+  fi
+
+  local joined
+  joined=$(IFS=,; echo "${idx_fields[*]}")
+  local key_spec="{$joined}"
+
+  echo ""
+  echo "索引选项:"
+  echo "  [1] 普通索引  [2] 唯一索引(UNIQUE)  [3] 稀疏索引(SPARSE)  [4] 唯一+稀疏"
+  local opt
+  read -rp "选择 [默认1]: " opt
+  opt=${opt:-1}
+
+  local options="{}"
+  case "$opt" in
+    2) options='{"unique":true}' ;;
+    3) options='{"sparse":true}' ;;
+    4) options='{"unique":true,"sparse":true}' ;;
+    *) options='{}' ;;
+  esac
+
+  local idx_name=""
+  read -rp "索引名称 (回车自动生成): " idx_name
+  if [[ -n "$idx_name" ]]; then
+    options="${options%\}},\"name\":\"$idx_name\"}"
+    options="${options/\{,/\{}"
+  fi
+
+  echo ""
+  echo "即将创建: db.$COLLECTION.createIndex($key_spec, $options)"
+  local confirm
+  read -rp "确认创建? [y/N]: " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
+
+  local display_name="${idx_name:-$key_spec}"
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').createIndex($key_spec, $options)"
+
+  run_js_spinner "正在创建索引 [$display_name] ..." "$js"
+  echo "结果: $RUN_JS_RESULT"
+  echo ""
+  show_indexes
+}
+
+drop_index() {
+  echo ""
+  echo "集合 [$COLLECTION] 的索引列表:"
+  print_sep
+
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').getIndexes().forEach((idx,i) => print((i+1) + '|' + idx.name))"
+  local raw
+  raw=$(run_js "$js")
+  if [[ -z "$raw" ]]; then
+    echo "  (无索引或查询失败)"
+    return
+  fi
+
+  local -a idx_names
+  while IFS='|' read -r num name; do
+    [[ -z "$num" ]] && continue
+    idx_names+=("$name")
+    if [[ "$name" == "_id_" ]]; then
+      printf "  [%s] %s  (系统索引，不可删除)\n" "$num" "$name"
+    else
+      printf "  [%s] %s\n" "$num" "$name"
+    fi
+  done <<< "$raw"
+  print_sep
+
+  local choice
+  read -rp "输入要删除的索引编号 (回车取消): " choice
+  [[ -z "$choice" ]] && echo "已取消" && return
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#idx_names[@]} )); then
+    echo "无效编号"
+    return
+  fi
+
+  local target="${idx_names[$((choice - 1))]}"
+  if [[ "$target" == "_id_" ]]; then
+    echo "错误: _id_ 是系统默认索引，不允许删除" >&2
+    return
+  fi
+
+  echo ""
+  echo "即将删除索引: $target"
+  local confirm
+  read -rp "确认删除? [y/N]: " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
+
+  local drop_js="db.getSiblingDB('$DB').getCollection('$COLLECTION').dropIndex('$target')"
+  run_js_spinner "正在删除索引 [$target] ..." "$drop_js"
+
+  if echo "$RUN_JS_RESULT" | grep -q '"ok" *: *1'; then
+    echo "删除成功"
+  else
+    echo "删除失败: $RUN_JS_RESULT" >&2
+  fi
+  echo ""
+  show_indexes
+}
+
+# ========== COLLECTION MANAGEMENT ==========
+
+rename_collection() {
+  echo ""
+  echo "当前集合: $COLLECTION"
+  local new_name
+  read -rp "输入新名称 (回车取消): " new_name
+  [[ -z "$new_name" ]] && echo "已取消" && return
+
+  if [[ "$new_name" == "$COLLECTION" ]]; then
+    echo "新名称与当前名称相同，无需修改"
+    return
+  fi
+
+  local exists
+  local safe_name
+  safe_name=$(escape_js_str "$new_name")
+  exists=$(run_js "print(db.getSiblingDB('$DB').getCollectionNames().includes('$safe_name'))")
+  if [[ "$exists" == "true" ]]; then
+    echo "错误: 集合 [$new_name] 已存在" >&2
+    return
+  fi
+
+  echo ""
+  echo "即将执行: $COLLECTION -> $new_name"
+  local confirm
+  read -rp "确认重命名? [y/N]: " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
+
+  local js="db.getSiblingDB('admin').runCommand({renameCollection:'$DB.$COLLECTION',to:'$DB.$safe_name'})"
+  run_js_spinner "正在重命名 [$COLLECTION] -> [$new_name] ..." "$js"
+
+  if echo "$RUN_JS_RESULT" | grep -q '"ok" *: *1'; then
+    echo "重命名成功"
+    COLLECTION="$new_name"
+    echo "当前集合已切换为: $COLLECTION"
+    analyze_fields
+  else
+    echo "重命名失败: $RUN_JS_RESULT" >&2
+  fi
+}
+
+drop_collection() {
+  echo ""
+  local count
+  count=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments({})")
+  echo "集合 [$COLLECTION] 当前包含 $count 条文档"
+  echo ""
+  echo "⚠ 此操作不可恢复！"
+  echo "请输入集合名称 [$COLLECTION] 以确认删除:"
+  local input
+  read -rp "> " input
+
+  if [[ "$input" != "$COLLECTION" ]]; then
+    echo "名称不匹配，已取消"
+    return
+  fi
+
+  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').drop()"
+  run_js_spinner "正在删除集合 [$COLLECTION] ..." "$js"
+
+  if [[ "$RUN_JS_RESULT" == "true" ]]; then
+    echo "删除成功"
+    echo "请重新选择集合"
+    select_collection
+  else
+    echo "删除失败: $RUN_JS_RESULT" >&2
+  fi
+}
+
+create_collection() {
+  echo ""
+  local name
+  read -rp "新集合名称: " name
+  [[ -z "$name" ]] && echo "已取消" && return
+
+  local safe_name
+  safe_name=$(escape_js_str "$name")
+  local exists
+  exists=$(run_js "print(db.getSiblingDB('$DB').getCollectionNames().includes('$safe_name'))")
+  if [[ "$exists" == "true" ]]; then
+    echo "错误: 集合 [$name] 已存在" >&2
+    return
+  fi
+
+  echo "  [1] 普通集合  [2] 固定大小集合(Capped)"
+  local mode
+  read -rp "选择 [默认1]: " mode
+  mode=${mode:-1}
+
+  local js
+  if [[ "$mode" == "2" ]]; then
+    local size
+    read -rp "最大大小(字节，如 10485760 = 10MB): " size
+    [[ -z "$size" ]] && size=10485760
+    local max_docs
+    read -rp "最大文档数(回车不限): " max_docs
+
+    if [[ -n "$max_docs" ]]; then
+      js="db.getSiblingDB('$DB').createCollection('$safe_name',{capped:true,size:$size,max:$max_docs})"
+    else
+      js="db.getSiblingDB('$DB').createCollection('$safe_name',{capped:true,size:$size})"
+    fi
+  else
+    js="db.getSiblingDB('$DB').createCollection('$safe_name')"
+  fi
+
+  run_js_spinner "正在创建集合 [$name] ..." "$js"
+
+  if echo "$RUN_JS_RESULT" | grep -q '"ok" *: *1'; then
+    echo "创建成功，已自动切换到: $name"
+    COLLECTION="$name"
+    analyze_fields
+  else
+    echo "创建失败: $RUN_JS_RESULT" >&2
+  fi
+}
+
+# ========== STATISTICS ==========
+
+do_coll_stats() {
+  echo ""
+  echo "集合 [$COLLECTION] 统计信息:"
+  print_sep
+
+  local js
+  js=$(cat <<JSEOF
+const s = db.getSiblingDB('$DB').getCollection('$COLLECTION').stats();
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1024*1024*1024) return (b/1024/1024).toFixed(1) + ' MB';
+  return (b/1024/1024/1024).toFixed(2) + ' GB';
+}
+print('文档数量: ' + s.count);
+print('数据大小: ' + fmtSize(s.size));
+print('存储大小: ' + fmtSize(s.storageSize));
+print('索引大小: ' + fmtSize(s.totalIndexSize));
+print('平均文档: ' + (s.count > 0 ? fmtSize(Math.round(s.size / s.count)) : 'N/A'));
+print('索引数量: ' + s.nindexes);
+if (s.capped) print('类型: Capped (maxSize=' + fmtSize(s.maxSize) + ')');
+print('');
+print('索引详情:');
+for (const [name, size] of Object.entries(s.indexSizes || {})) {
+  print('  ' + name + ': ' + fmtSize(size));
+}
+JSEOF
+)
+
+  run_js "$js"
+  print_sep
+}
+
+do_aggregation() {
+  echo ""
+  if (( ${#FIELD_NAMES[@]} == 0 )); then
+    echo "字段信息为空，请先查看字段"
+    return
+  fi
+
+  echo "选择聚合字段:"
+  local i=1
+  for f in "${FIELD_NAMES[@]}"; do
+    printf "  [%d] %s (%s)\n" "$i" "$f" "${FIELD_TYPES[$((i-1))]}"
+    ((i++))
+  done
+  print_sep
+
+  local fidx
+  read -rp "字段编号: " fidx
+  if ! [[ "$fidx" =~ ^[0-9]+$ ]] || (( fidx < 1 || fidx > ${#FIELD_NAMES[@]} )); then
+    echo "无效编号"
+    return
+  fi
+  local agg_field="${FIELD_NAMES[$((fidx - 1))]}"
+
+  echo ""
+  echo "聚合操作:"
+  echo "  [1] count  [2] sum  [3] avg  [4] min  [5] max"
+  local op
+  read -rp "选择: " op
+
+  local agg_op
+  case "$op" in
+    1) agg_op="count" ;;
+    2) agg_op="sum" ;;
+    3) agg_op="avg" ;;
+    4) agg_op="min" ;;
+    5) agg_op="max" ;;
+    *) echo "无效选择"; return ;;
+  esac
+
+  echo ""
+  echo "是否按字段分组? (输入字段编号，回车跳过)"
+  local gidx
+  read -rp "分组字段编号: " gidx
+
+  local group_field="null"
+  if [[ "$gidx" =~ ^[0-9]+$ ]] && (( gidx >= 1 && gidx <= ${#FIELD_NAMES[@]} )); then
+    group_field="\"\$${FIELD_NAMES[$((gidx - 1))]}\""
+  fi
+
+  local agg_expr
+  if [[ "$agg_op" == "count" ]]; then
+    agg_expr='{"$sum":1}'
+  else
+    agg_expr="{\"\\$$agg_op\":\"\\\$$agg_field\"}"
+  fi
+
+  local js
+  js=$(cat <<JSEOF
+const pipeline = [
+  { \$group: { _id: $group_field, result: $agg_expr } },
+  { \$sort: { result: -1 } },
+  { \$limit: 50 }
+];
+const results = db.getSiblingDB('$DB').getCollection('$COLLECTION').aggregate(pipeline).toArray();
+if (results.length === 0) {
+  print('无结果');
+} else {
+  results.forEach(r => {
+    const key = r._id !== null ? String(r._id) : '(全部)';
+    print(key + ': ' + r.result);
+  });
+  print('');
+  print('共 ' + results.length + ' 条结果');
+}
+JSEOF
+)
+
+  echo ""
+  echo "聚合: $agg_op($agg_field) group by ${group_field}"
+  print_sep
+  run_js "$js"
+  print_sep
+}
+
+# ========== ENVIRONMENT ==========
+
+switch_database() {
+  echo ""
+  echo "正在获取数据库列表..."
+  local js="db.adminCommand('listDatabases').databases.forEach(d => print(d.name + '|' + d.sizeOnDisk))"
+  local raw
+  raw=$(run_js "$js")
+
+  if [[ -z "$raw" ]]; then
+    echo "无法获取数据库列表 (可能缺少权限)"
+    echo "手动输入数据库名称:"
+    local manual_db
+    read -rp "> " manual_db
+    [[ -z "$manual_db" ]] && echo "已取消" && return
+    DB="$manual_db"
+    MONGO_URI=$(echo "$MONGO_URI" | sed "s|/[^?]*?|/$DB?|")
+    echo "已切换到: $DB"
+    select_collection
+    return
+  fi
+
+  local -a db_names
+  local i=1
+  printf "  %-4s %-20s %s\n" "编号" "数据库" "大小"
+  print_sep
+  while IFS='|' read -r name size; do
+    [[ -z "$name" ]] && continue
+    db_names+=("$name")
+    local fmt_size
+    if (( size < 1024 )); then fmt_size="${size} B"
+    elif (( size < 1048576 )); then fmt_size="$(( size / 1024 )) KB"
+    elif (( size < 1073741824 )); then fmt_size="$(( size / 1048576 )) MB"
+    else fmt_size="$(( size / 1073741824 )) GB"
+    fi
+    printf "  [%d] %-20s %s\n" "$i" "$name" "$fmt_size"
+    ((i++))
+  done <<< "$raw"
+  print_sep
+
+  local choice
+  read -rp "选择数据库 [1-${#db_names[@]}]: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#db_names[@]} )); then
+    DB="${db_names[$((choice - 1))]}"
+    MONGO_URI=$(echo "$MONGO_URI" | sed "s|/[^?]*?|/$DB?|")
+    echo "已切换到: $DB"
+    select_collection
+  else
+    echo "无效输入"
+  fi
+}
+
+switch_environment() {
+  local cfg
+  cfg=$(cat "$CONFIG_FILE")
+
+  if ! echo "$cfg" | grep -q '"environments"'; then
+    echo "当前配置不支持多环境 (config.json 中无 environments 字段)"
+    return
+  fi
+
+  load_config_multi_env "$cfg"
+  select_collection
+}
+
+# ========== SUB-MENUS ==========
+
+menu_query() {
+  while true; do
+    echo ""
+    echo "── 查询 ──────────────────────"
+    echo "  [1] 查询数据        [2] 字段投影查询"
+    echo "  [3] 分页浏览        [4] Explain 分析"
+    echo "  [5] 自定义排序查询"
+    echo "  [b] 返回主菜单"
+    echo "──────────────────────────────"
+    local act
+    read -rp "选择: " act
+    case "$act" in
+      1) do_query ;;
+      2) do_query_projection ;;
+      3) do_query_pagination ;;
+      4) do_query_explain ;;
+      5) do_query_custom_sort ;;
+      b|B) return ;;
+      *) echo "无效输入" ;;
+    esac
+  done
+}
+
+menu_data() {
+  while true; do
+    echo ""
+    echo "── 数据操作 ──────────────────"
+    echo "  [1] 删除文档        [2] 更新文档"
+    echo "  [3] 导出数据(JSON/CSV)"
+    echo "  [b] 返回主菜单"
+    echo "──────────────────────────────"
+    local act
+    read -rp "选择: " act
+    case "$act" in
+      1) do_delete ;;
+      2) do_update ;;
+      3) do_export ;;
+      b|B) return ;;
+      *) echo "无效输入" ;;
+    esac
+  done
+}
+
+menu_index() {
+  while true; do
+    echo ""
+    echo "── 索引管理 ──────────────────"
+    echo "  [1] 查看索引        [2] 创建索引"
+    echo "  [3] 删除索引"
+    echo "  [b] 返回主菜单"
+    echo "──────────────────────────────"
+    local act
+    read -rp "选择: " act
+    case "$act" in
+      1) show_indexes ;;
+      2) create_index ;;
+      3) drop_index ;;
+      b|B) return ;;
+      *) echo "无效输入" ;;
+    esac
+  done
+}
+
+menu_collection() {
+  while true; do
+    echo ""
+    echo "── 集合管理 ──────────────────"
+    echo "  [1] 切换集合        [2] 查看字段"
+    echo "  [3] 重命名集合      [4] 删除集合"
+    echo "  [5] 创建集合"
+    echo "  [b] 返回主菜单"
+    echo "──────────────────────────────"
+    local act
+    read -rp "选择: " act
+    case "$act" in
+      1) select_collection ;;
+      2) analyze_fields ;;
+      3) rename_collection ;;
+      4) drop_collection ;;
+      5) create_collection ;;
+      b|B) return ;;
+      *) echo "无效输入" ;;
+    esac
+  done
+}
+
+menu_stats() {
+  while true; do
+    echo ""
+    echo "── 统计分析 ──────────────────"
+    echo "  [1] 集合统计(collStats)"
+    echo "  [2] 聚合统计(count/sum/avg/min/max)"
+    echo "  [b] 返回主菜单"
+    echo "──────────────────────────────"
+    local act
+    read -rp "选择: " act
+    case "$act" in
+      1) do_coll_stats ;;
+      2) do_aggregation ;;
+      b|B) return ;;
+      *) echo "无效输入" ;;
+    esac
+  done
+}
+
+menu_env() {
+  while true; do
+    echo ""
+    echo "── 环境切换 ──────────────────"
+    echo "  [1] 切换数据库"
+    echo "  [2] 多环境配置选择"
+    echo "  [b] 返回主菜单"
+    echo "──────────────────────────────"
+    local act
+    read -rp "选择: " act
+    case "$act" in
+      1) switch_database ;;
+      2) switch_environment ;;
+      b|B) return ;;
+      *) echo "无效输入" ;;
+    esac
+  done
+}
+
+# ========== MAIN ==========
+
+main() {
+  echo "=============================="
+  echo "  MongoDB 交互管理工具"
+  echo "=============================="
+
+  load_config
+  detect_mongosh
+  if ! select_collection; then
+    echo "提示: 请通过 [e] 环境切换 检查配置" >&2
+  fi
+
+  while true; do
+    echo ""
+    echo "=============================="
+    echo "  MongoDB 交互管理工具"
+    echo "  当前: $DB > $COLLECTION"
+    echo "=============================="
+    echo ""
+    echo "  [q] 查询        [d] 数据操作      [i] 索引管理"
+    echo "  [c] 集合管理    [s] 统计分析      [e] 环境切换"
+    echo "  [h] 查询历史    [x] 退出"
+    echo ""
+    echo "  快捷: [1] 快速查询  [f] 查看字段"
+    echo ""
+    local action
+    read -rp "请输入: " action
+    case "$action" in
+      q|Q) menu_query ;;
+      d|D) menu_data ;;
+      i|I) menu_index ;;
+      c|C) menu_collection ;;
+      s|S) menu_stats ;;
+      e|E) menu_env ;;
+      h|H) show_history ;;
+      x|X) echo "再见"; exit 0 ;;
+      1)   do_query ;;
+      f|F) analyze_fields ;;
+      *)   echo "无效输入" ;;
+    esac
+  done
+}
+
+main

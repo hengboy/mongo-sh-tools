@@ -1,0 +1,11 @@
+{
+  "host": "localhost",
+  "port": 27017,
+  "database": "test",
+  "username": "",
+  "password": "",
+  "authSource": "admin",
+  "ssl": false,
+  "defaultLimit": 20,
+  "exportLimit": 10000
+}

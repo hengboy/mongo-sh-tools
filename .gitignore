@@ -1,0 +1,6 @@
+mongosh
+config.json
+.mongo_history
+export_*.json
+export_*.csv
+*.tmp
