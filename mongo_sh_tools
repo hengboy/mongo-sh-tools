@@ -20,6 +20,7 @@ COLLECTION=""
 FILTER="{}"
 DB=""
 MONGO_URI=""
+RETURN_TO_MAIN=false
 DEFAULT_LIMIT=20
 EXPORT_LIMIT=10000
 ENV_NAME=""
@@ -543,6 +544,7 @@ select_collection() {
       COLLECTION="${cols[$((choice - 1))]}"
       echo "已选择: $COLLECTION"
       analyze_fields
+      RETURN_TO_MAIN=true
       return
     fi
     echo "无效输入，请重新选择"
@@ -1804,6 +1806,7 @@ menu_index() {
 
 menu_collection() {
   while true; do
+    $RETURN_TO_MAIN && return
     echo ""
     echo "── 集合管理 ──────────────────"
     echo "  [1] 切换集合        [2] 查看字段"
@@ -1814,7 +1817,7 @@ menu_collection() {
     local act
     read -rp "选择: " act
     case "$act" in
-      1) select_collection; return ;;
+      1) select_collection ;;
       2) analyze_fields ;;
       3) rename_collection ;;
       4) drop_collection ;;
@@ -1846,6 +1849,7 @@ menu_stats() {
 
 menu_env() {
   while true; do
+    $RETURN_TO_MAIN && return
     echo ""
     echo "── 环境切换 ──────────────────"
     echo "  [1] 切换数据库"
@@ -1875,8 +1879,10 @@ main() {
   if ! select_collection; then
     echo "提示: 请通过 [e] 环境切换 检查配置" >&2
   fi
+  RETURN_TO_MAIN=false
 
   while true; do
+    RETURN_TO_MAIN=false
     echo ""
     echo "=============================="
     echo "  MongoDB 交互管理工具"
