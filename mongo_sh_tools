@@ -1814,7 +1814,7 @@ menu_collection() {
     local act
     read -rp "选择: " act
     case "$act" in
-      1) select_collection ;;
+      1) select_collection; return ;;
       2) analyze_fields ;;
       3) rename_collection ;;
       4) drop_collection ;;
