@@ -30,9 +30,11 @@ SUGGEST_FILTERS=()
 
 # ---------- load config ----------
 
-parse_json_field() { echo "$1" | grep -o "\"$2\" *: *\"[^\"]*\"" | head -1 | sed "s/\"$2\" *: *\"\([^\"]*\)\"/\1/"; }
-parse_json_num()   { echo "$1" | grep -o "\"$2\" *: *[0-9]*" | head -1 | sed "s/\"$2\" *: *\([0-9]*\)/\1/"; }
-parse_json_bool()  { echo "$1" | grep -o "\"$2\" *: *[a-z]*" | head -1 | sed "s/\"$2\" *: *\([a-z]*\)/\1/"; }
+parse_json_field() { echo "$1" | tr -d '\r' | grep -o "\"$2\" *: *\"[^\"]*\"" | head -1 | sed "s/\"$2\" *: *\"\([^\"]*\)\"/\1/"; }
+parse_json_num()   { echo "$1" | tr -d '\r' | grep -o "\"$2\" *: *[0-9]*" | head -1 | sed "s/\"$2\" *: *\([0-9]*\)/\1/"; }
+parse_json_bool()  { echo "$1" | tr -d '\r' | grep -o "\"$2\" *: *[a-z]*" | head -1 | sed "s/\"$2\" *: *\([a-z]*\)/\1/"; }
+
+CONN_HOST="" CONN_PORT="" CONN_USER="" CONN_PASS="" CONN_AUTH="" CONN_SSL=""
 
 build_mongo_uri() {
   local host="$1" port="$2" database="$3" username="$4" password="$5" auth_source="$6" ssl_flag="$7"
@@ -44,12 +46,21 @@ build_mongo_uri() {
   local ssl_param="false"
   [[ "$ssl_flag" == "true" ]] && ssl_param="true"
 
+  # save connection params for rebuild
+  CONN_HOST="$host" CONN_PORT="$port" CONN_USER="$username"
+  CONN_PASS="$password" CONN_AUTH="$auth_source" CONN_SSL="$ssl_param"
+
   if [[ -n "$username" && -n "$password" ]]; then
     MONGO_URI="mongodb://${username}:${password}@${host}:${port}/${database}?authSource=${auth_source}&ssl=${ssl_param}"
   else
     MONGO_URI="mongodb://${host}:${port}/${database}?ssl=${ssl_param}"
   fi
   DB="$database"
+}
+
+rebuild_uri_with_db() {
+  local new_db="$1"
+  build_mongo_uri "$CONN_HOST" "$CONN_PORT" "$new_db" "$CONN_USER" "$CONN_PASS" "$CONN_AUTH" "$CONN_SSL"
 }
 
 config_is_valid() {
@@ -205,7 +216,7 @@ load_config() {
     need_setup=true
   else
     local cfg
-    cfg=$(cat "$CONFIG_FILE")
+    cfg=$(tr -d '\r' < "$CONFIG_FILE")
     if ! config_is_valid "$cfg"; then
       need_setup=true
     fi
@@ -216,7 +227,7 @@ load_config() {
   fi
 
   local cfg
-  cfg=$(cat "$CONFIG_FILE")
+  cfg=$(tr -d '\r' < "$CONFIG_FILE")
 
   if ! config_is_valid "$cfg"; then
     echo "错误: 配置文件内容无效，请检查 $CONFIG_FILE" >&2
@@ -387,6 +398,14 @@ run_export_streaming() {
   rm -f "$jsfile"
 }
 
+build_count_expr() {
+  if [[ "$FILTER" == "{}" ]]; then
+    echo "col.estimatedDocumentCount()"
+  else
+    echo "col.countDocuments($FILTER)"
+  fi
+}
+
 escape_js_str() {
   local s="$1"
   s="${s//\\/\\\\}"
@@ -464,12 +483,26 @@ show_history() {
     echo ""
     echo "执行: db.$COLLECTION.find($FILTER).sort({_id:-1}).limit($lim)"
     print_sep
-    local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1}).limit($lim).forEach(doc => print(JSON.stringify(doc, null, 2)))"
-    run_js "$js"
-    print_sep
+    local count_expr
+    if [[ "$FILTER" == "{}" ]]; then
+      count_expr="col.estimatedDocumentCount()"
+    else
+      count_expr="col.countDocuments($FILTER)"
+    fi
+    local js
+    js=$(cat <<JSEOF
+const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
+col.find($FILTER).sort({_id:-1}).limit($lim).forEach(doc => print(JSON.stringify(doc, null, 2)));
+print('__TOTAL__:' + $count_expr);
+JSEOF
+)
+    local raw
+    raw=$(run_js "$js")
     local total
-    total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
-    echo "匹配总数: $total | 本次显示: $lim 条"
+    total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
+    echo "$raw" | grep -v '^__TOTAL__:'
+    print_sep
+    echo "匹配总数: ${total:-?} | 本次显示: $lim 条"
   else
     echo "无效编号"
   fi
@@ -830,13 +863,22 @@ do_query() {
   echo "执行: db.$COLLECTION.find($FILTER).sort({_id:-1}).limit($limit)"
   print_sep
 
-  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)))"
-  run_js "$js"
-  print_sep
-
+  local count_expr
+  count_expr=$(build_count_expr)
+  local js
+  js=$(cat <<JSEOF
+const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
+col.find($FILTER).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)));
+print('__TOTAL__:' + $count_expr);
+JSEOF
+)
+  local raw
+  raw=$(run_js "$js")
   local total
-  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
-  echo "匹配总数: $total | 本次显示: $limit 条"
+  total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
+  echo "$raw" | grep -v '^__TOTAL__:'
+  print_sep
+  echo "匹配总数: ${total:-?} | 本次显示: $limit 条"
 
   save_history "$FILTER" "$limit"
 }
@@ -854,13 +896,22 @@ do_query_projection() {
   echo "执行: db.$COLLECTION.find($FILTER, $PROJECTION).sort({_id:-1}).limit($limit)"
   print_sep
 
-  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER, $PROJECTION).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)))"
-  run_js "$js"
-  print_sep
-
+  local count_expr
+  count_expr=$(build_count_expr)
+  local js
+  js=$(cat <<JSEOF
+const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
+col.find($FILTER, $PROJECTION).sort({_id:-1}).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)));
+print('__TOTAL__:' + $count_expr);
+JSEOF
+)
+  local raw
+  raw=$(run_js "$js")
   local total
-  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
-  echo "匹配总数: $total | 本次显示: $limit 条"
+  total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
+  echo "$raw" | grep -v '^__TOTAL__:'
+  print_sep
+  echo "匹配总数: ${total:-?} | 本次显示: $limit 条"
 
   save_history "$FILTER" "$limit"
 }
@@ -873,8 +924,14 @@ do_query_pagination() {
 
   build_filter
 
+  local count_js
+  if [[ "$FILTER" == "{}" ]]; then
+    count_js="db.getSiblingDB('$DB').getCollection('$COLLECTION').estimatedDocumentCount()"
+  else
+    count_js="db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)"
+  fi
   local total
-  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  total=$(run_js "$count_js")
   [[ ! "$total" =~ ^[0-9]+$ ]] && total=0
   local total_pages=$(( (total + page_size - 1) / page_size ))
   (( total_pages == 0 )) && total_pages=1
@@ -965,13 +1022,22 @@ do_query_custom_sort() {
   echo "执行: db.$COLLECTION.find($FILTER).sort($SORT_SPEC).limit($limit)"
   print_sep
 
-  local js="db.getSiblingDB('$DB').getCollection('$COLLECTION').find($FILTER).sort($SORT_SPEC).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)))"
-  run_js "$js"
-  print_sep
-
+  local count_expr
+  count_expr=$(build_count_expr)
+  local js
+  js=$(cat <<JSEOF
+const col = db.getSiblingDB('$DB').getCollection('$COLLECTION');
+col.find($FILTER).sort($SORT_SPEC).limit($limit).forEach(doc => print(JSON.stringify(doc, null, 2)));
+print('__TOTAL__:' + $count_expr);
+JSEOF
+)
+  local raw
+  raw=$(run_js "$js")
   local total
-  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
-  echo "匹配总数: $total | 本次显示: $limit 条"
+  total=$(echo "$raw" | grep '^__TOTAL__:' | sed 's/^__TOTAL__://')
+  echo "$raw" | grep -v '^__TOTAL__:'
+  print_sep
+  echo "匹配总数: ${total:-?} | 本次显示: $limit 条"
 
   save_history "$FILTER" "$limit"
 }
@@ -1088,8 +1154,14 @@ do_update() {
 do_export() {
   build_filter
 
+  local count_js
+  if [[ "$FILTER" == "{}" ]]; then
+    count_js="db.getSiblingDB('$DB').getCollection('$COLLECTION').estimatedDocumentCount()"
+  else
+    count_js="db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)"
+  fi
   local total
-  total=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments($FILTER)")
+  total=$(run_js "$count_js")
   [[ ! "$total" =~ ^[0-9]+$ ]] && total=0
   echo ""
   echo "匹配文档数: $total"
@@ -1408,8 +1480,8 @@ rename_collection() {
 drop_collection() {
   echo ""
   local count
-  count=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').countDocuments({})")
-  echo "集合 [$COLLECTION] 当前包含 $count 条文档"
+  count=$(run_js "db.getSiblingDB('$DB').getCollection('$COLLECTION').estimatedDocumentCount()")
+  echo "集合 [$COLLECTION] 当前包含约 $count 条文档"
   echo ""
   echo "⚠ 此操作不可恢复！"
   echo "请输入集合名称 [$COLLECTION] 以确认删除:"
@@ -1615,8 +1687,7 @@ switch_database() {
     local manual_db
     read -rp "> " manual_db
     [[ -z "$manual_db" ]] && echo "已取消" && return
-    DB="$manual_db"
-    MONGO_URI=$(echo "$MONGO_URI" | sed "s|/[^?]*?|/$DB?|")
+    rebuild_uri_with_db "$manual_db"
     echo "已切换到: $DB"
     select_collection
     return
@@ -1643,8 +1714,7 @@ switch_database() {
   local choice
   read -rp "选择数据库 [1-${#db_names[@]}]: " choice
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#db_names[@]} )); then
-    DB="${db_names[$((choice - 1))]}"
-    MONGO_URI=$(echo "$MONGO_URI" | sed "s|/[^?]*?|/$DB?|")
+    rebuild_uri_with_db "${db_names[$((choice - 1))]}"
     echo "已切换到: $DB"
     select_collection
   else
@@ -1654,7 +1724,7 @@ switch_database() {
 
 switch_environment() {
   local cfg
-  cfg=$(cat "$CONFIG_FILE")
+  cfg=$(tr -d '\r' < "$CONFIG_FILE")
 
   if ! echo "$cfg" | grep -q '"environments"'; then
     echo "当前配置不支持多环境 (config.json 中无 environments 字段)"
