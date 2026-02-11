@@ -11,8 +11,10 @@
 #   5. ./mongo_sh
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/config.json"
-HISTORY_FILE="$SCRIPT_DIR/.mongo_history"
+DATA_DIR="$HOME/.mongo_sh_tools"
+mkdir -p "$DATA_DIR"
+CONFIG_FILE="$DATA_DIR/config.json"
+HISTORY_FILE="$DATA_DIR/.mongo_history"
 MONGOSH=""
 COLLECTION=""
 FILTER="{}"
@@ -1189,7 +1191,7 @@ do_export() {
   ts=$(date '+%Y%m%d_%H%M%S')
   local ext="json"
   [[ "$fmt" == "2" ]] && ext="csv"
-  local outfile="$SCRIPT_DIR/export_${COLLECTION}_${ts}.$ext"
+  local outfile="$DATA_DIR/export_${COLLECTION}_${ts}.$ext"
 
   if [[ "$fmt" == "2" ]]; then
     # CSV export
