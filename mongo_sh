@@ -1235,7 +1235,7 @@ JSEOF
   fi
 
   local line_count
-  line_count=$(wc -l < "$outfile")
+  line_count=$(grep -c . "$outfile" 2>/dev/null || echo 0)
   echo "已导出: $outfile ($line_count 行)"
 }
 
