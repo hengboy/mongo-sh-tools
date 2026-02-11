@@ -1,17 +1,19 @@
-# mongo_sh — MongoDB 交互管理工具
+# mongo_sh_tools — MongoDB 交互管理工具
 
 纯 Bash 实现的 MongoDB 交互式管理脚本，零依赖（仅需 `mongosh`），适用于无法安装图形化工具的 Linux 服务器环境。
 
 ## 目录结构
 
 ```
-mongo_sh_tool/
-  mongo_sh        # 主脚本（唯一执行文件）
-  config.json     # 连接配置（首次运行时自动引导生成）
-  .mongo_history  # 查询历史记录（自动生成，无需手动管理）
+mongo_sh_tools/
+  mongo_sh_tools  # 主脚本（唯一执行文件）
   export_*.json   # 导出的 JSON 文件（按需生成）
   export_*.csv    # 导出的 CSV 文件（按需生成）
   mongosh         # mongosh 二进制（需手动放置，见下方部署说明）
+
+~/.mongo_sh_tools/
+  config.json     # 连接配置（首次运行时自动引导生成）
+  .mongo_history  # 查询历史记录（自动生成，无需手动管理）
 ```
 
 ## 部署
@@ -25,21 +27,21 @@ wget https://downloads.mongodb.com/compass/mongosh-2.3.8-linux-x64.tgz
 tar xzf mongosh-2.3.8-linux-x64.tgz
 ```
 
-将解压后的 `mongosh-2.3.8-linux-x64/bin/mongosh` 拷贝到 `mongo_sh_tool/` 目录下。
+将解压后的 `mongosh-2.3.8-linux-x64/bin/mongosh` 拷贝到脚本同目录下。
 
 > 如果目标服务器 PATH 中已安装 mongosh，可跳过此步。脚本会优先使用同目录下的 mongosh，其次使用系统 PATH 中的。
 
 ### 2. 赋权并运行
 
 ```bash
-cd mongo_sh_tool
-chmod +x mongo_sh mongosh
-./mongo_sh
+cd mongo_sh_tools
+chmod +x mongo_sh_tools mongosh
+./mongo_sh_tools
 ```
 
 ### 3. 首次配置
 
-首次运行时，如果 `config.json` 不存在或内容无效，脚本会自动启动配置向导：
+首次运行时，如果 `~/.mongo_sh_tools/config.json` 不存在或内容无效，脚本会自动启动配置向导：
 
 ```
 ==============================
@@ -67,7 +69,7 @@ chmod +x mongo_sh mongosh
 | SSL | 是否启用 SSL | 否 |
 | 默认查询条数 | 每次查询的默认 limit | `20` |
 
-配置完成后自动写入 `config.json` 并继续启动。
+配置完成后自动写入 `~/.mongo_sh_tools/config.json` 并继续启动。
 
 ---
 
@@ -197,7 +199,7 @@ chmod +x mongo_sh mongosh
 | 3 | 导出数据 | 构建过滤 → 设置导出条数 → 选择 JSON/CSV 格式 → 流式写入文件 |
 
 - **删除/更新**：当未设置过滤条件（空 filter）且选择了 Many 操作时，会显示醒目警告
-- **导出数据**：默认导出上限为 `10000` 条（可通过 config.json 的 `exportLimit` 修改），导出时可临时输入其他值，输入 `0` 则不限制
+- **导出数据**：默认导出上限为 `10000` 条（可通过 `~/.mongo_sh_tools/config.json` 的 `exportLimit` 修改），导出时可临时输入其他值，输入 `0` 则不限制
 - CSV 导出以集合字段名作为表头，逐行流式输出，字段中的逗号替换为分号、换行替换为空格
 
 ### [i] 索引管理
@@ -230,13 +232,13 @@ chmod +x mongo_sh mongosh
 | 编号 | 功能 | 说明 |
 |------|------|------|
 | 1 | 切换数据库 | 通过 `listDatabases` 列出所有数据库（含大小），选择后重新选集合。如无权限则手动输入 |
-| 2 | 多环境配置选择 | 重新加载 `config.json` 中的 `environments` 列表，选择并切换到目标环境 |
+| 2 | 多环境配置选择 | 重新加载配置文件中的 `environments` 列表，选择并切换到目标环境 |
 
 > 环境切换后会重新选择集合并分析字段。
 
 ### [h] 查询历史
 
-- 自动保存最近 **20 条**查询记录到 `.mongo_history`
+- 自动保存最近 **20 条**查询记录到 `~/.mongo_sh_tools/.mongo_history`
 - 每条记录包含：时间、集合名、过滤条件、查询条数
 - 选择编号可重新执行该查询（如果集合不同会自动切换）
 
@@ -288,15 +290,15 @@ chmod +x mongo_sh mongosh
 
 匹配文档数: 58000
 导出条数上限 [默认 10000，0=不限]:
-  提示: 匹配 58000 条，将只导出前 10000 条 (可在 config.json 中修改 exportLimit)
+  提示: 匹配 58000 条，将只导出前 10000 条 (可在 ~/.mongo_sh_tools/config.json 中修改 exportLimit)
 
 导出格式:  [1] JSON  [2] CSV
 选择 [默认1]: 2
   ✓ 正在导出 CSV...
-已导出: /path/to/mongo_sh_tool/export_device_logs_20250211_143022.csv (10001 行)
+已导出: /path/to/mongo_sh_tools/export_device_logs_20250211_143022.csv (10000 行)
 ```
 
-> 导出条数上限默认 10000，可在 config.json 中修改 `exportLimit`，或在导出时临时输入其他值（输入 `0` 不限制）。
+> 导出条数上限默认 10000，可在 `~/.mongo_sh_tools/config.json` 中修改 `exportLimit`，或在导出时临时输入其他值（输入 `0` 不限制）。
 
 ### Explain 分析慢查询
 
@@ -362,10 +364,10 @@ error: 78.9
 - **空 filter 警告**：执行 `deleteMany` 或 `updateMany` 时若未设置过滤条件，会显示醒目警告提示将影响全部文档
 - **删除文档 / 删除集合** 等破坏性操作均需**二次确认**，删除集合还需手动输入集合名
 - **临时文件保护**：脚本运行时的临时 JS 文件（`/tmp/mq_*.js`）权限设为 `600`，仅当前用户可读
-- 密码在配置向导中使用**隐藏输入**（`read -s`），但会明文写入 `config.json`
-- 建议对 `config.json` 设置合适的文件权限：
+- 密码在配置向导中使用**隐藏输入**（`read -s`），但会明文写入 `~/.mongo_sh_tools/config.json`
+- 建议对配置文件设置合适的文件权限：
   ```bash
-  chmod 600 config.json
+  chmod 600 ~/.mongo_sh_tools/config.json
   ```
 - 脚本不会对外发起任何网络请求，所有操作仅通过 `mongosh` 与指定的 MongoDB 实例通信
 
@@ -384,7 +386,7 @@ error: 78.9
 
 ### Q: 启动报错 "未找到 mongosh"
 
-将 mongosh 二进制放到 `mongo_sh_tool/` 目录下并赋予执行权限：
+将 mongosh 二进制放到脚本同目录下并赋予执行权限：
 
 ```bash
 chmod +x mongosh
@@ -392,7 +394,7 @@ chmod +x mongosh
 
 ### Q: 连接超时 / 无法获取集合列表
 
-检查 `config.json` 中的 host、port 是否正确，以及网络是否可达：
+检查 `~/.mongo_sh_tools/config.json` 中的 host、port 是否正确，以及网络是否可达：
 
 ```bash
 telnet 10.110.0.106 27018
@@ -402,19 +404,19 @@ telnet 10.110.0.106 27018
 
 ### Q: 如何修改已有配置？
 
-直接编辑 `config.json`，下次启动时自动生效。也可以删除 `config.json` 后重新运行脚本触发配置向导。
+直接编辑 `~/.mongo_sh_tools/config.json`，下次启动时自动生效。也可以删除该文件后重新运行脚本触发配置向导。
 
 ### Q: 如何从单环境升级为多环境？
 
-手动编辑 `config.json`，将原有配置包裹进 `environments` 数组中（参考上方多环境格式），并为每个环境添加 `name` 字段。`defaultLimit` 和 `exportLimit` 放在顶层，所有环境共享。
+手动编辑 `~/.mongo_sh_tools/config.json`，将原有配置包裹进 `environments` 数组中（参考上方多环境格式），并为每个环境添加 `name` 字段。`defaultLimit` 和 `exportLimit` 放在顶层，所有环境共享。
 
 ### Q: 导出的文件在哪里？
 
-导出文件生成在 `mongo_sh_tool/` 目录下，命名格式为 `export_<集合名>_<时间戳>.json` 或 `.csv`。
+导出文件生成在脚本同目录下，命名格式为 `export_<集合名>_<时间戳>.json` 或 `.csv`。
 
 ### Q: 如何修改导出条数限制？
 
-在 `config.json` 中添加或修改 `exportLimit` 字段：
+在 `~/.mongo_sh_tools/config.json` 中添加或修改 `exportLimit` 字段：
 
 ```json
 {
@@ -426,8 +428,8 @@ telnet 10.110.0.106 27018
 
 ### Q: 旧版 .mongo_history 格式不兼容？
 
-历史记录分隔符从 `|` 更新为 tab 字符。如果旧历史记录显示异常，删除 `.mongo_history` 文件即可，不影响任何功能：
+历史记录分隔符从 `|` 更新为 tab 字符。如果旧历史记录显示异常，删除历史文件即可，不影响任何功能：
 
 ```bash
-rm .mongo_history
+rm ~/.mongo_sh_tools/.mongo_history
 ```
